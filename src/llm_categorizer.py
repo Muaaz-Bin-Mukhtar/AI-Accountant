@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import pandas as pd
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -19,29 +20,33 @@ if not api_key:
 # Initialize OpenAI client
 client = OpenAI(api_key=api_key, base_url=base_url)
 
-# Allowed spending categories
-ALLOWED_CATEGORIES = [
-    "Food", "Transport", "Shopping", "Bills", "Pharmacy",
-    "Groceries", "Entertainment", "Utilities", "Other"
-]
 
-def categorize_with_llm(df):
-    """Categorize transactions using LLM if category is 'Other'."""
-    unknowns = df[df["category"] == "Other"]
-    if unknowns.empty:
-        print("✅ No 'Other' transactions — nothing to send to LLM.")
+def categorize_with_llm(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Categorize transactions using LLM if category is 'Other'.
+    Returns DataFrame with updated 'category' only.
+    """
+
+    # Filter transactions with 'Other' category
+    df_to_categorize = df[df['category'] == 'Other'].copy()
+    if df_to_categorize.empty:
+        print("ℹ️ No transactions with category 'Other' to categorize.")
         return df
 
-    print(f"🔍 Sending {len(unknowns)} uncategorized transactions to LLM...")
+    print(f"🔍 Sending {len(df_to_categorize)} uncategorized transactions to LLM...")
 
     # Prepare transactions for LLM
-    transactions = unknowns[["description", "amount"]].to_dict(orient="records")
+    transactions = df_to_categorize[["description", "amount"]].to_dict(orient="records")
 
     prompt = f"""
 You are a financial transaction categorizer.
-Assign each transaction one of these categories ONLY: {', '.join(ALLOWED_CATEGORIES)}.
-Return a valid JSON array where each item contains:
-"description", "amount", "category", and a short "rationale".
+Assign each transaction one of the categories.
+There should be no vague category like 'Other'.
+Return ONLY a valid JSON array, no explanations, no markdown, no text.
+Each item must contain:
+- "description"
+- "amount"
+- "category"
 
 Transactions:
 {json.dumps(transactions, indent=2)}
@@ -51,7 +56,7 @@ Transactions:
         response = client.chat.completions.create(
             model=os.getenv("MODEL", "gpt-4o-mini"),
             messages=[
-                {"role": "system", "content": "You must return only valid JSON."},
+                {"role": "system", "content": "You must return ONLY valid JSON array. Nothing else."},
                 {"role": "user", "content": prompt}
             ],
             temperature=0.2
@@ -59,12 +64,19 @@ Transactions:
 
         content = response.choices[0].message.content.strip()
 
-        # Parse JSON safely
+        # Debug: print raw LLM response
+        print("🔹 LLM raw response:\n", content)
+
+        # Extract JSON array using regex
+        match = re.search(r"\[.*\]", content, re.DOTALL)
+        if not match:
+            print("❌ No JSON array found in LLM response.")
+            return df
+
         try:
-            result = json.loads(content)
+            result = json.loads(match.group(0))
         except json.JSONDecodeError as e:
-            print("❌ Failed to parse LLM response as JSON.")
-            print("Response content:", content)
+            print("❌ Failed to parse extracted JSON:", e)
             return df
 
         # Merge categorized results back into DataFrame
@@ -72,7 +84,6 @@ Transactions:
             desc = row.get("description")
             if desc in df["description"].values:
                 df.loc[df["description"] == desc, "category"] = row.get("category", "Other")
-                df.loc[df["description"] == desc, "rationale"] = row.get("rationale", "")
 
         print("✅ LLM categorization complete.")
         return df
